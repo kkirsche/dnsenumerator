@@ -14,7 +14,7 @@
 
 package main
 
-import "github.com/kkirsche/dnsenum/cmd"
+import "github.com/kkirsche/dnsenumerator/cmd"
 
 func main() {
 	cmd.Execute()
