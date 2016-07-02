@@ -40,6 +40,18 @@ var (
 	dnsServer string
 )
 
+// DNSResult is the individual lines of a DNS answer section
+type DNSResult struct {
+	Name       string
+	TTLSec     string
+	Class      string
+	Type       string
+	IP         string
+	Preference string
+}
+
+var afterFirst bool
+
 // RootCmd represents the base command when called without any subcommands
 var RootCmd = &cobra.Command{
 	Use:   "dnsenum",
@@ -54,12 +66,7 @@ to quickly create a Cobra application.`,
 	// has an action associated with it:
 	Run: func(cmd *cobra.Command, args []string) {
 		// wildcards := RandString(11)
-
 		for _, domain := range args {
-			if verbose {
-				logrus.WithField("domain", domain).Info("Looking up domain...")
-			}
-
 			c := new(dns.Client)
 			// CONFIGURE THE CLIENT ##################################################
 			timeoutStr := strconv.Itoa(timeout)
@@ -72,137 +79,114 @@ to quickly create a Cobra application.`,
 			c.ReadTimeout = timeoutDur
 			c.WriteTimeout = timeoutDur
 
-			// RETRIEVE A RECORDS ####################################################
-			addrs, rtt, err := retrieveARecord(c, domain)
-			if err != nil {
-				logrus.WithField("error", err).Errorln("Error received when retrieving A Record")
-			}
-			logrus.WithField("rtt", rtt).Info("A Record query completed in")
-			for _, addr := range addrs {
-				logrus.WithField("ip", addr).Info("Found IP Address")
-			}
-
-			// RETRIEVE NS RECORDS ###################################################
-			addrs, rtt, err = retrieveNSRecord(c, domain)
-			if err != nil {
-				logrus.WithField("error", err).Errorln("Error received when retrieving NS Record")
-			}
-			logrus.WithField("rtt", rtt).Info("NS Record query completed in")
-			for _, addr := range addrs {
-				logrus.WithField("ip", addr).Info("Found Name Server")
-			}
-
-			// RETRIEVE MX RECORDS ###################################################
-			addrs, rtt, err = retrieveMXRecord(c, domain)
-			if err != nil {
-				logrus.WithField("error", err).Errorln("Error received when retrieving NS Record")
-			}
-			logrus.WithField("rtt", rtt).Info("MX Record query completed in")
-			for _, addr := range addrs {
-				logrus.WithField("ip", addr).Info("Found MX CNAME")
-			}
-
-			// ZONE TRANSFER #########################################################
-			addrs, rtt, err = zoneTransferTest(c, domain)
-			if err != nil {
-				logrus.WithField("error", err).Errorln("Error received when retrieving NS Record")
-			}
-			logrus.WithField("rtt", rtt).Info("Zone Transfer (AXFR) query completed in")
-			for _, addr := range addrs {
-				logrus.WithField("ip", addr).Info("Found AXFR")
-			}
+			retrieveDomainInformation(c, domain)
 		}
 	},
 }
 
-func retrieveARecord(c *dns.Client, domain string) ([]string, time.Duration, error) {
+func retrieveDomainInformation(c *dns.Client, domain string) {
+	if afterFirst {
+		fmt.Println()
+	}
+	afterFirst = true
+
+	logrus.WithField("domain", domain).Info("Looking up domain...")
+	// RETRIEVE ANY RECORDS ##################################################
+	dnsResults, rtt, err := retrieveANYRecord(c, domain)
+	if err != nil {
+		logrus.WithField("error", err).Errorln("Error received when retrieving A Record")
+	}
+	logrus.WithField("rtt", rtt).Info("ANY Record query completed in")
+
+	// PRINT RESULTS OF ANY QUERY ############################################
+	var additionalDomains []string
+	if len(dnsResults) == 0 {
+		logrus.WithField("domain", domain).Errorln("No results found for domain")
+	} else {
+		for _, result := range dnsResults {
+			if result.Type != "MX" {
+				logrus.WithFields(logrus.Fields{
+					"ip":    result.IP,
+					"type":  result.Type,
+					"ttl":   result.TTLSec,
+					"class": result.Class,
+				}).Infoln(fmt.Sprintf("Found %s record", result.Type))
+			} else {
+				logrus.WithFields(logrus.Fields{
+					"ip":         result.IP,
+					"type":       result.Type,
+					"ttl":        result.TTLSec,
+					"preference": result.Preference,
+					"class":      result.Class,
+				}).Infoln(fmt.Sprintf("Found %s record", result.Type))
+			}
+			ip := net.ParseIP(result.IP)
+			if ip == nil {
+				additionalDomains = append(additionalDomains, result.IP)
+			}
+		}
+	}
+
+	// ZONE TRANSFER #########################################################
+	zones, rtt, err := zoneTransferTest(c, domain)
+	if err != nil {
+		logrus.WithField("error", err).Errorln("Error received when retrieving NS Record")
+	}
+	logrus.WithField("rtt", rtt).Infoln("Zone Transfer (AXFR) query completed in")
+	if len(zones) == 0 {
+		logrus.WithField("domain", domain).Errorln("No Zone Transfer allowed for domain")
+	} else {
+		for _, zone := range zones {
+			logrus.WithField("ip", zone).Infoln("Found AXFR")
+		}
+	}
+	for _, aDom := range additionalDomains {
+		retrieveDomainInformation(c, aDom)
+	}
+}
+
+func retrieveANYRecord(c *dns.Client, domain string) ([]DNSResult, time.Duration, error) {
 	ipv4m := new(dns.Msg)
 	ipv4m.Id = dns.Id()
 	ipv4m.RecursionDesired = true
 	ipv4m.Question = make([]dns.Question, 1)
-	ipv4m.Question[0] = dns.Question{Name: dns.Fqdn(domain), Qtype: dns.TypeA, Qclass: dns.ClassANY}
+	ipv4m.Question[0] = dns.Question{Name: dns.Fqdn(domain), Qtype: dns.TypeANY, Qclass: dns.ClassANY}
 
 	dnsServerPort := net.JoinHostPort(dnsServer, "53")
 
 	in, rtt, err := c.Exchange(ipv4m, dnsServerPort)
 	if err != nil {
 		dur, _ := time.ParseDuration("0s")
-		return []string{}, dur, err
+		return []DNSResult{}, dur, err
 	}
 
-	var addrs []string
+	var results []DNSResult
 	for _, answer := range in.Answer {
-		splitAnswer := strings.Split(answer.String(), "\t")
-		for _, answerField := range splitAnswer {
-			if net.ParseIP(answerField) == nil {
-				continue
+		lines := strings.Split(answer.String(), "\n")
+		for _, line := range lines {
+			splitLine := strings.Split(line, "\t")
+			var preferenceAndIP []string
+			if splitLine[3] == "MX" {
+				preferenceAndIP = strings.Split(splitLine[4], " ")
+
 			}
-			addrs = append(addrs, answerField)
+			result := DNSResult{
+				Name:   splitLine[0],
+				TTLSec: splitLine[1],
+				Class:  splitLine[2],
+				Type:   splitLine[3],
+				IP:     splitLine[4],
+			}
+
+			if result.Type == "MX" {
+				result.IP = preferenceAndIP[1]
+				result.Preference = preferenceAndIP[0]
+			}
+			results = append(results, result)
 		}
 	}
 
-	return addrs, rtt, nil
-}
-
-func retrieveNSRecord(c *dns.Client, domain string) ([]string, time.Duration, error) {
-	nsm := new(dns.Msg)
-	nsm.Id = dns.Id()
-	nsm.RecursionDesired = true
-	nsm.Question = make([]dns.Question, 1)
-	nsm.Question[0] = dns.Question{Name: dns.Fqdn(domain), Qtype: dns.TypeNS, Qclass: dns.ClassANY}
-
-	dnsServerPort := net.JoinHostPort(dnsServer, "53")
-
-	in, rtt, err := c.Exchange(nsm, dnsServerPort)
-	if err != nil {
-		dur, _ := time.ParseDuration("0s")
-		return []string{}, dur, err
-	}
-
-	var nss []string
-	for _, answer := range in.Ns {
-		splitAnswer := strings.Split(answer.String(), "\t")
-		for i, answerField := range splitAnswer {
-			if i%4 == 0 && i != 0 {
-				fields := strings.Split(answerField, " ")
-				for i, field := range fields {
-					if i == 0 || i == 1 {
-						nss = append(nss, field)
-					}
-				}
-			}
-		}
-	}
-
-	return nss, rtt, nil
-}
-
-func retrieveMXRecord(c *dns.Client, domain string) ([]string, time.Duration, error) {
-	nsm := new(dns.Msg)
-	nsm.Id = dns.Id()
-	nsm.RecursionDesired = true
-	nsm.Question = make([]dns.Question, 1)
-	nsm.Question[0] = dns.Question{Name: dns.Fqdn(domain), Qtype: dns.TypeMX, Qclass: dns.ClassANY}
-
-	dnsServerPort := net.JoinHostPort(dnsServer, "53")
-
-	in, rtt, err := c.Exchange(nsm, dnsServerPort)
-	if err != nil {
-		dur, _ := time.ParseDuration("0s")
-		return []string{}, dur, err
-	}
-
-	var mxs []string
-	for _, answer := range in.Answer {
-		splitAnswer := strings.Split(answer.String(), "\t")
-		for i, answerField := range splitAnswer {
-			if i%4 == 0 && i != 0 {
-				mxs = append(mxs, answerField)
-			}
-		}
-	}
-
-	return mxs, rtt, nil
+	return results, rtt, nil
 }
 
 func zoneTransferTest(c *dns.Client, domain string) ([]string, time.Duration, error) {
